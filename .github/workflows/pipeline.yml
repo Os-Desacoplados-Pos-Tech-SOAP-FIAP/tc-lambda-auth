@@ -1,9 +1,8 @@
 name: Pipeline
 
-# Esteira da função serverless:
-#   PR            -> lint + testes + build + terraform plan
-#   merge na main -> lint + testes + build + terraform apply (deploy contínuo)
-#   botão Actions -> plan | apply | destroy sob demanda
+# Esteira da função serverless em dois estágios:
+#   ci   -> lint, testes, build e terraform plan (livre, sem custo)
+#   apply-> exige APROVAÇÃO no environment `aws-infra` antes de criar ou destruir
 on:
   pull_request:
     branches: [main]
@@ -18,7 +17,7 @@ on:
         default: plan
 
 permissions:
-  id-token: write # OIDC: o job troca este token por credenciais AWS temporárias
+  id-token: write
   contents: read
 
 concurrency:
@@ -30,7 +29,9 @@ env:
   ROLE_ARN: arn:aws:iam::538880133939:role/gha-tc-lambda-auth
 
 jobs:
-  pipeline:
+  ci:
+    name: Lint, testes e plan (sem custo)
+    if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.action == 'plan')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -66,18 +67,55 @@ jobs:
         run: terraform -chdir=terraform init -input=false
 
       - name: Terraform plan
-        if: github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.action == 'plan')
         run: |
           terraform -chdir=terraform plan -no-color -input=false | tee plan.txt
           {
             echo '## Terraform plan'
             echo '```'
-            tail -n 80 plan.txt
+            tail -n 60 plan.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  apply:
+    name: Apply / Destroy (requer aprovação)
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.action != 'plan')
+    runs-on: ubuntu-latest
+    # Gate de custo: aguarda aprovação de um revisor do environment.
+    environment: aws-infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Instala dependências
+        run: npm ci
+
+      - name: Testes
+        run: npm test
+
+      - name: Build dos bundles
+        # O destroy também precisa dos diretórios de bundle: o archive_file do
+        # Terraform lê `dist/` mesmo quando a operação é de remoção.
+        run: npm run build
+
+      - name: Credenciais AWS via OIDC (sem secrets)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform init
+        run: terraform -chdir=terraform init -input=false
+
       - name: Terraform apply
-        if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.action == 'apply')
+        if: github.event_name == 'push' || inputs.action == 'apply'
         run: terraform -chdir=terraform apply -auto-approve -input=false
 
       - name: Terraform destroy
